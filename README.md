@@ -7,25 +7,33 @@ Built as a prototype on Windows with Claude Code + the Pieces MCP server.
 ## What it does
 
 1. **`tool_registry.md`** (you create your own from `tool_registry.example.md`) is a plain-markdown inventory: one entry per tool, with a purpose, a trigger condition ("use when..."), access info, and a growing list of dated `Observed:` lines recording real usage.
-2. **`heartbeat-wrapper.ps1`** runs on a timer (default: every 45 minutes, via Task Scheduler). Each run:
+2. **`scripts/heartbeat-wrapper.ps1`** runs on a timer (default: every 45 minutes, via Task Scheduler). Each run:
    - Queries Pieces for recent activity (`ask_pieces_ltm` / `workstream_summaries_full_text_search`).
    - Logs real, dated observations against matching registry entries.
    - Adds newly-discovered tools/services (capped at 2 per run, to avoid registry bloat from one big session).
-   - Fires a Windows balloon-tip notification when activity matches a registry trigger you're not already using, or suggests a likely next tool based on an established pattern.
+   - Fires a Windows balloon-tip notification when activity matches a registry trigger not already in use (`NOTIFY:`), or suggests a likely next tool based on an established pattern across multiple prior observations (`SUGGEST:`).
    - Optionally mirrors genuinely verified findings back into Pieces' own long-term memory via `create_pieces_memory` — never speculation, only concrete evidenced facts.
-3. **`feature-gap-wrapper.ps1`** runs once daily. It picks one registry entry and does a real web-research pass on that tool's current feature set, looking for free/low-effort capabilities you're plausibly not using yet.
+3. **`scripts/feature-gap-wrapper.ps1`** runs once daily. It picks one registry entry and does a real web-research pass on that tool's current feature set, looking for free/low-effort capabilities plausibly not yet in use.
 
 ## Setup
 
-1. Copy `tool_registry.example.md` to `tool_registry.md` and fill in your own tools.
-2. Edit `heartbeat-wrapper.ps1` and `feature-gap-wrapper.ps1`'s default `$RegistryPath` if you don't want to pass it as a parameter every time (or just always call with `-RegistryPath "C:\path\to\your\tool_registry.md"`).
-3. Make sure the [Pieces MCP server](https://docs.pieces.app/products/mcp/claude-code) is connected in Claude Code, and Pieces OS is running.
-4. In an **elevated** PowerShell window:
+1. Copy `tool_registry.example.md` to your own Claude Code memory directory as `tool_registry.md`, and fill in your own tools.
+2. Make sure the [Pieces MCP server](https://docs.pieces.app/products/mcp/claude-code) is connected in Claude Code, and Pieces OS is running.
+3. In an **elevated** PowerShell window, from this repo's root:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File "scripts\register-heartbeat-task.ps1" -ScriptDir "$PWD\scripts"
+   powershell -ExecutionPolicy Bypass -File "scripts\register-feature-gap-task.ps1" -ScriptDir "$PWD\scripts"
    ```
-   powershell -ExecutionPolicy Bypass -File register-heartbeat-task.ps1
-   powershell -ExecutionPolicy Bypass -File register-feature-gap-task.ps1
+   Both wrapper scripts default to reading/writing `tool_registry.example.md` and logs alongside themselves in `scripts/` — pass `-RegistryPath` / `-LogPath` explicitly (either directly, or by editing the registered task's arguments) to point at your real registry file instead:
+   ```powershell
+   .\scripts\heartbeat-wrapper.ps1 -RegistryPath "C:\path\to\your\tool_registry.md" -LogPath "C:\path\to\heartbeat-log.txt"
    ```
-5. Both scheduled tasks check whether Pieces OS (`pieces_for_x.exe`) is running and exit immediately if not — so they're safe to leave registered even when Pieces isn't active.
+   The wrapper scripts can run directly from wherever this repo lives — there's no need to copy them elsewhere first, since paths are parameterized rather than hardcoded.
+4. Both scheduled tasks check whether Pieces OS (`pieces_for_x.exe`) is running and exit immediately if not — so they're safe to leave registered even when Pieces isn't active.
+
+## Logs
+
+`heartbeat-log.txt` and `feature-gap-log.txt` are written wherever `-LogPath` points (default: alongside the wrapper scripts). They're not tracked in this repo (see `.gitignore`) — constantly-growing runtime output, not source.
 
 ## Design notes and gotchas (learned the hard way)
 
@@ -41,4 +49,8 @@ Built as a prototype on Windows with Claude Code + the Pieces MCP server.
 
 - This is a prototype, not a polished product. The registry can grow unbounded over time with no automatic pruning/summarization step yet.
 - Stray `claude.exe` processes have been observed not exiting promptly in some headless runs — worth periodically checking `tasklist` for orphaned processes if you notice memory creep.
-- No dashboard/UI — `tool_registry.md`, `heartbeat-log.txt`, and `feature-gap-log.txt` are the only interfaces.
+- No dashboard/UI — `tool_registry.md` and the two log files are the only interfaces.
+
+## Related
+
+`tool_registry.md` itself is expected to live in your own Claude Code memory directory, not in this repo — this repo only holds the automation that maintains it. The file format this automation expects: a markdown file with `## <category>` headers, entries formatted as `**Name** — purpose | trigger: ... | access | status`, and nested `- Observed: <date> — ...` sub-bullets that accumulate over time.
