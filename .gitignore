@@ -1,0 +1,3 @@
+# Runtime output, not source - regenerated constantly, not meant to be versioned
+*.log
+*-log.txt

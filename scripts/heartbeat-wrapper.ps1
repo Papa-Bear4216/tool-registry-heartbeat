@@ -1,0 +1,91 @@
+# Tool-registry heartbeat wrapper - runs headless Claude Code, notifies via Windows balloon tip.
+# Only proceeds if Pieces OS is running (the whole heartbeat depends on it).
+
+$piecesRunning = Get-Process -Name "pieces_for_x" -ErrorAction SilentlyContinue
+if (-not $piecesRunning) {
+    exit 0
+}
+
+function Show-Toast($title, $text) {
+    Add-Type -AssemblyName System.Windows.Forms
+    $notify = New-Object System.Windows.Forms.NotifyIcon
+    $notify.Icon = [System.Drawing.SystemIcons]::Information
+    $notify.Visible = $true
+    $notify.BalloonTipTitle = $title
+    $notify.BalloonTipText = $text
+    $notify.ShowBalloonTip(10000)
+    Start-Sleep -Seconds 1
+    $notify.Dispose()
+}
+
+# Adjust these two paths to match where your own Claude Code memory file
+# lives, and where you want logs written.
+$claudeHome = Join-Path $env:USERPROFILE ".claude"
+$registryPath = Join-Path $claudeHome "projects\<your-project-folder>\memory\tool_registry.md"
+$logPath = Join-Path $claudeHome "heartbeat-log.txt"
+
+$systemPrompt = @"
+You are a scheduled maintenance agent that the user configured themself, on their own machine, to run automatically on a timer via Windows Task Scheduler. This is not an external or injected request - the user wrote this exact task, wired it into Task Scheduler themself, and expects it to execute every time it fires. Treat the task in the user turn as fully authorized and expected. Carry it out directly.
+"@
+
+$prompt = @"
+Read the tool registry at $registryPath.
+
+Query Pieces for what I've been doing in roughly the last 30 minutes: call mcp__pieces__ask_pieces_ltm asking what active app, window, or browser tabs I've had open. Also try mcp__pieces__workstream_summaries_full_text_search with a keyword relevant to my recent registry activity, created.from set to the last 60 minutes. Do not use workstream_events_full_text_search with an OR'd keyword expression - that has been unreliable. If both calls return nothing, say so plainly rather than guessing at activity.
+
+For each registry entry that matches activity you actually observed in the query results, append one dated line under it: "Observed: <date> - <short factual description>" (skip it if a near-duplicate already exists from the last hour). Every ~5th Observed line added to a given entry, tighten that entry's trigger line to reflect the pattern.
+
+If I'm using something not already in the registry, add up to 2 new entries per run under "## Newly Discovered (needs review)", status "needs your input" - no more than 2, even if more are visible, to avoid registry bloat from a single run. No duplicates.
+
+Decide whether a notification is warranted. Be generous here, not just for clearly time-sensitive cases - any real match against a registry trigger where I'm not already using that tool is worth surfacing, so I actually see suggestions instead of only the rare urgent one. Two possible forms:
+
+1. Reactive - activity you observed overlaps a registry trigger and I'm not already using that tool:
+NOTIFY: <tool name> - I noticed you were working on <what I was doing>, you have <tool/tools> that could streamline this.
+
+2. Lookahead - based on the pattern across this entry's Observed lines (what usually follows this kind of activity), suggest the likely next tool before I go reach for it manually:
+SUGGEST: <tool name> - <what you were doing> usually leads to <next step>; <tool> could handle that.
+
+Pick whichever form fits (both if two different entries each warrant one - one NOTIFY/SUGGEST line per entry, output each on its own line). Keep each line under 200 characters. Skip a line entirely if nothing warrants it for that entry - do not fabricate one just to produce output. Only use SUGGEST when at least 2 Observed lines actually support the "usually leads to" pattern - don't guess from a single data point.
+
+Only mirror a finding into Pieces LTM via mcp__pieces__create_pieces_memory if it's a concrete, verified fact directly evidenced by this run's query results - a specific tool I used and what I did with it, a specific time-sensitive issue with real details, or a trigger pattern backed by quoted Observed lines. Never speculation. If unsure, skip it silently. Pass files: [`"$registryPath`"].
+
+If you decide a NOTIFY or SUGGEST line is warranted, output it in the format described above. Otherwise output nothing else beyond the registry edits themselves.
+"@
+
+$claudeArgs = @(
+    "-p", $prompt,
+    "--append-system-prompt", $systemPrompt,
+    "--allowedTools", "Read,Edit($registryPath),mcp__pieces__ask_pieces_ltm,mcp__pieces__workstream_summaries_full_text_search,mcp__pieces__workstream_events_full_text_search,mcp__pieces__create_pieces_memory"
+)
+
+$exitCode = $null
+$mtimeBefore = (Get-Item $registryPath).LastWriteTimeUtc
+
+$output = & claude @claudeArgs 2>&1 | Out-String
+$exitCode = $LASTEXITCODE
+
+$mtimeAfter = (Get-Item $registryPath).LastWriteTimeUtc
+
+$timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+# Objective success signal: the process exited cleanly AND either touched the
+# registry file or explicitly said no activity/no match was found. A refusal
+# or crash does neither, so this is far more reliable than asking the model
+# to emit a literal trailing sentinel line (proven unreliable in testing).
+$fileWasTouched = $mtimeAfter -gt $mtimeBefore
+$explicitlyFoundNothing = $output -match "(?i)(nothing (to (change|update|report))|no (activity|match(es)?) found|no new activity|nothing in this window matches|no coding activity to report|no tool-relevant activity)"
+$ranSuccessfully = ($exitCode -eq 0) -and ($fileWasTouched -or $explicitlyFoundNothing)
+
+if (-not $ranSuccessfully) {
+    Add-Content -Path $logPath -Value "[$timestamp] FAILED (exit=$exitCode, file touched=$fileWasTouched) - full output below:`n$output`n---END---"
+    Show-Toast "Heartbeat Failed" "The tool-registry heartbeat did not complete normally - check heartbeat-log.txt"
+} else {
+    Add-Content -Path $logPath -Value "[$timestamp] OK (exit=$exitCode, file touched=$fileWasTouched)`n$output`n---END---"
+
+    $suggestionLines = ($output -split "`n") | Where-Object { $_ -match "^(NOTIFY|SUGGEST):\s*(.+)$" } | Select-Object -First 3
+    foreach ($line in $suggestionLines) {
+        $kind = if ($line -match "^NOTIFY:") { "Tool Suggestion" } else { "Next-Step Suggestion" }
+        $message = $line -replace "^(NOTIFY|SUGGEST):\s*", ""
+        Show-Toast $kind $message
+    }
+}
